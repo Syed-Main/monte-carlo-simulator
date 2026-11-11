@@ -36,11 +36,15 @@ TAIL_LEVEL = 99            # VaR and CTE are measured at this percentile
 TAIL_RANK_BY = "Retained"  # column used to pick the VaR / CTE years ("Gross" or "Retained")
 FREQUENCY_RANK_BY = "Claims"   # column used to pick the frequency VaR / CTE years
 OUTPUT_FOLDER = Path("output")
-# Mortality adjustment for large sums assured: qx is divided by MORTALITY_DIVISOR for every life
-# with sum assured strictly greater than ADJUST_ABOVE_SUM_ASSURED. Set the divisor to 1 to switch off.
-ADJUST_ABOVE_SUM_ASSURED = 10_000_000
-MORTALITY_DIVISOR = 3
+# Mortality adjustment by sum assured band: qx is DIVIDED by the divisor of the band the life falls in.
+# Each entry is (lower bound, divisor); the lower bound is included, the upper bound is the next band's
+# lower bound. Keep the list from the highest bound to the lowest. A divisor below 1 raises qx.
+# Lives below the lowest bound are not adjusted. Use an empty list to switch the adjustment off.
+MORTALITY_BANDS = [(20_000_000, 2.3),
+                   (10_000_000, 1.25),
+                   (5_000_000, 0.9)]
 CELLS_PER_BATCH = 10_000_000   # memory control only; does not change results
+EXPORT_GRANULARITY = True      # default answer to the granularity prompt; the prompt can override it
 EXCEL_MAX_DATA_ROWS = 1_048_575   # Excel allows 1,048,576 rows including the header
 
 
@@ -76,6 +80,15 @@ def non_negative_whole_number(text):
     return value
 
 
+def yes_no(text):
+    answer = text.strip().lower()
+    if answer in ("y", "yes", "true", "1", "on"):
+        return True
+    if answer in ("n", "no", "false", "0", "off"):
+        return False
+    raise ValueError("answer yes or no")
+
+
 def percentile_list(text):
     values = sorted({float(part) for part in text.replace(",", " ").split()})
     if not values or any(not np.isfinite(v) or v <= 0 or v >= 100 for v in values):
@@ -92,6 +105,8 @@ def ask_settings():
         "seed": ask("Random seed", DEFAULT_SEED, non_negative_whole_number),
         "percentiles": ask("Percentiles", ", ".join(f"{p:g}" for p in DEFAULT_PERCENTILES),
                            percentile_list),
+        "granularity": ask("Export policy-level granularity (yes/no)",
+                           "yes" if EXPORT_GRANULARITY else "no", yes_no),
     }
 
 
@@ -163,9 +178,22 @@ def check_inputs(policies, mortality):
     checked["Age"] = checked["Age"].astype(int)
     checked["SumAssured"] = sa
     checked["qx_table"] = checked["Age"].map(rates)
-    large = checked["SumAssured"] > ADJUST_ABOVE_SUM_ASSURED
-    checked["qx"] = np.where(large, checked["qx_table"] / MORTALITY_DIVISOR, checked["qx_table"])
+    checked["qx_divisor"] = band_divisors(checked["SumAssured"])
+    checked["qx"] = np.minimum(checked["qx_table"] / checked["qx_divisor"], 1.0)   # qx can never exceed 1
     return checked
+
+
+def band_divisors(sum_assured):
+    """The mortality divisor for each life, from MORTALITY_BANDS (1.0 if below every band)."""
+    sa = sum_assured.to_numpy(dtype=float)
+    return np.select([sa >= lower for lower, _ in MORTALITY_BANDS],
+                     [divisor for _, divisor in MORTALITY_BANDS], default=1.0)
+
+
+def band_label(index):
+    lower, divisor = MORTALITY_BANDS[index]
+    upper = MORTALITY_BANDS[index - 1][0] if index > 0 else None
+    return f"{lower:,} to below {upper:,}" if upper else f"{lower:,} and above"
 
 
 def portfolio_fingerprint(policies):
@@ -470,9 +498,9 @@ def main():
     policies, mortality = read_inputs(settings["input_file"])
     policies = check_inputs(policies, mortality)
     print(f"  {len(policies):,} lives, total sum assured {policies['SumAssured'].sum():,.0f}")
-    if MORTALITY_DIVISOR != 1:
-        n_adj = int((policies["SumAssured"] > ADJUST_ABOVE_SUM_ASSURED).sum())
-        print(f"  qx divided by {MORTALITY_DIVISOR:g} for {n_adj:,} lives with sum assured above {ADJUST_ABOVE_SUM_ASSURED:,}")
+    for i, (_, divisor) in enumerate(MORTALITY_BANDS):
+        in_band = int((policies["qx_divisor"] == divisor).sum())
+        print(f"  qx divided by {divisor:g} for {in_band:,} lives with sum assured {band_label(i)}")
 
     print("Simulating...")
     sims = simulate(policies["qx"].to_numpy(), policies["SumAssured"].to_numpy(dtype=float),
@@ -480,19 +508,22 @@ def main():
     exact = exact_values(policies, retention)
     summary, pct, frequency, var_sims, var_rows = calculate_metrics(sims, exact, settings["percentiles"])
 
-    rep_row = representative_simulation(sims, exact)
-    extreme_row = int(var_rows[0])     # lowest simulation number if several years tie at the VaR value
-    rep_id = int(sims["Simulation"].iloc[rep_row])
-    extreme_id = int(sims["Simulation"].iloc[extreme_row])
+    if settings["granularity"]:
+        rep_row = representative_simulation(sims, exact)
+        extreme_row = int(var_rows[0])     # lowest simulation number if several years tie at the VaR value
+        rep_id = int(sims["Simulation"].iloc[rep_row])
+        extreme_id = int(sims["Simulation"].iloc[extreme_row])
+    else:
+        rep_id = extreme_id = "not exported (granularity off)"
 
     run_info = pd.DataFrame([
         ("Input file", Path(settings["input_file"]).name),
         ("Portfolio fingerprint", portfolio_fingerprint(policies)),
         ("Number of lives", len(policies)),
         ("Total sum assured", policies["SumAssured"].sum()),
-        ("Mortality adjustment: sum assured above", ADJUST_ABOVE_SUM_ASSURED),
-        ("Mortality adjustment: qx divided by", MORTALITY_DIVISOR),
-        ("Lives with adjusted qx", int((policies["SumAssured"] > ADJUST_ABOVE_SUM_ASSURED).sum())),
+        *[(f"qx divisor, sum assured {band_label(i)}",
+           f"{divisor:g}  ({int((policies['qx_divisor'] == divisor).sum()):,} lives)")
+          for i, (_, divisor) in enumerate(MORTALITY_BANDS)],
         ("Expected deaths before adjustment (table qx)", policies["qx_table"].sum()),
         ("Expected deaths (sum of adjusted qx)", policies["qx"].sum()),
         ("Expected claims (sum of qx, sum assured > 0)", exact["Claims"]),
@@ -520,6 +551,9 @@ def main():
     print("\n" + summary.to_string(index=False, float_format=lambda v: f"{v:,.0f}"))
     print("\n" + frequency.head(len(summary)).to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
     print(f"\nSaved: {path}")
+
+    if not settings["granularity"]:
+        return
 
     print("\nExporting policy-level granularity...")
     granularity_path = OUTPUT_FOLDER / f"granularity_{tag}.xlsx"
