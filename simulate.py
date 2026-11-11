@@ -44,6 +44,9 @@ MORTALITY_BANDS = [(20_000_000, 2.3),
                    (10_000_000, 1.25),
                    (5_000_000, 0.9)]
 CELLS_PER_BATCH = 10_000_000   # memory control only; does not change results
+# Sum assured bands for the claim frequency breakdown: (lower bound included, upper bound excluded).
+# The last band has no upper bound. Lives with sum assured 0 never claim, so they are in no band.
+CLAIM_BANDS = [(0, 5_000_000), (5_000_000, 10_000_000), (10_000_000, 20_000_000), (20_000_000, None)]
 EXPORT_GRANULARITY = True      # default answer to the granularity prompt; the prompt can override it
 EXCEL_MAX_DATA_ROWS = 1_048_575   # Excel allows 1,048,576 rows including the header
 
@@ -202,6 +205,21 @@ def portfolio_fingerprint(policies):
     return hashlib.md5(data).hexdigest()[:12]
 
 
+def claim_band_labels():
+    labels = []
+    for lower, upper in CLAIM_BANDS:
+        labels.append(f"Claims {lower / 1e6:g}M+" if upper is None
+                      else f"Claims {lower / 1e6:g}-{upper / 1e6:g}M")
+    return labels
+
+
+def claim_band_masks(sum_assured):
+    """For each band label, a True/False array over the lives (sum assured > 0 and inside the band)."""
+    sa = np.asarray(sum_assured, dtype=float)
+    return {label: (sa > 0) & (sa >= lower) & ((sa < upper) if upper is not None else True)
+            for label, (lower, upper) in zip(claim_band_labels(), CLAIM_BANDS)}
+
+
 # ---------------------------------------------------------------- 4-5. simulate
 def simulate(qx, sum_assured, retention, simulations, seed):
     """
@@ -219,9 +237,11 @@ def simulate(qx, sum_assured, retention, simulations, seed):
     rng = np.random.default_rng(seed)
     retained_if_dies = np.minimum(sum_assured, retention)
     ceded_if_dies = sum_assured - retained_if_dies
-    columns = ["Claims", "Ceded claims", "Gross", "Retained", "Ceded"]
+    band_masks = claim_band_masks(sum_assured)
+    columns = ["Claims", "Ceded claims", "Gross", "Retained", "Ceded"] + list(band_masks)
     amounts = np.column_stack([(sum_assured > 0).astype(float), (sum_assured > retention).astype(float),
-                               sum_assured, retained_if_dies, ceded_if_dies])
+                               sum_assured, retained_if_dies, ceded_if_dies]
+                              + [mask.astype(float) for mask in band_masks.values()])
 
     totals = np.zeros((simulations, len(columns)))
     batch = max(1, CELLS_PER_BATCH // len(qx))      # simulations handled per pass
@@ -241,11 +261,14 @@ def simulate(qx, sum_assured, retention, simulations, seed):
 def exact_values(policies, retention):
     """Exact expected values (sum of probability x amount) for every simulated column."""
     qx, sa = policies["qx"], policies["SumAssured"]
-    return {"Claims": qx[sa > 0].sum(),
-            "Ceded claims": qx[sa > retention].sum(),
-            "Gross": (qx * sa).sum(),
-            "Retained": (qx * np.minimum(sa, retention)).sum(),
-            "Ceded": (qx * np.maximum(0, sa - retention)).sum()}
+    exact = {"Claims": qx[sa > 0].sum(),
+             "Ceded claims": qx[sa > retention].sum(),
+             "Gross": (qx * sa).sum(),
+             "Retained": (qx * np.minimum(sa, retention)).sum(),
+             "Ceded": (qx * np.maximum(0, sa - retention)).sum()}
+    for label, mask in claim_band_masks(sa).items():
+        exact[label] = qx.to_numpy()[mask].sum()
+    return exact
 
 
 def var_scenarios(sims, rank_by, level=TAIL_LEVEL):
@@ -311,7 +334,7 @@ def calculate_metrics(sims, exact, percentiles):
         pct[col] = np.percentile(sims[col], percentiles)
 
     # Frequency (number of claims)
-    count_cols = ["Claims", "Ceded claims"]
+    count_cols = ["Claims", "Ceded claims"] + claim_band_labels()
     frequency, freq_var_rows = metrics_table(sims, count_cols, exact, FREQUENCY_RANK_BY)
     freq_pct = pd.DataFrame({"Metric": [f"Percentile {p:g}%" for p in percentiles]})
     for col in count_cols:
@@ -529,6 +552,8 @@ def main():
         ("Expected claims (sum of qx, sum assured > 0)", exact["Claims"]),
         ("Retention limit", retention),
         ("Lives above retention", int((policies["SumAssured"] > retention).sum())),
+        *[(f"Lives in band, {label.lower()}", int(mask.sum()))
+          for label, mask in claim_band_masks(policies["SumAssured"]).items()],
         ("Number of simulations", settings["simulations"]),
         ("Random seed", settings["seed"]),
         ("Percentiles", " ".join(f"{p:g}" for p in settings["percentiles"])),
