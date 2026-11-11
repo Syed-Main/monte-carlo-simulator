@@ -1,12 +1,10 @@
 """
-generate_sample.py: builds a synthetic input workbook for simulate.py.
+Build a synthetic input workbook (sample_input.xlsx) for simulate.py.
 
-Policies are invented, so no real policyholder data is used. The Mortality
-tab is copied from mortality.csv, the SOA recommended mortality table for
-Pakistan based on the SLIC dataset.
+Policies are randomly generated so no real policyholder data is included.
+The Mortality sheet is loaded from mortality.csv (SOA SLIC Pakistan table).
 
-Output: sample_input.xlsx with tabs "Policies" and "Mortality".
-Usage:  python generate_sample.py [lives] [seed]
+Usage: python generate_sample.py [lives] [seed]
 """
 
 import sys
@@ -22,25 +20,24 @@ MORTALITY_FILE = Path(__file__).with_name("mortality.csv")
 
 
 def load_mortality():
-    """SOA recommended mortality for Pakistan (SLIC based), columns Age and qx."""
+    """Load the Age/qx mortality table from mortality.csv."""
     if not MORTALITY_FILE.exists():
         raise SystemExit(f"Missing {MORTALITY_FILE.name}: put the Age, qx table next to this script.")
     return pd.read_csv(MORTALITY_FILE)
 
 
 def build_policies(lives, rng):
-    # Working ages 20 to 64, centred on the late 30s (group-life style portfolio)
     ages = np.clip(rng.normal(38, 9, lives).round(), 20, 64).astype(int)
 
-    # Sum assured: lognormal body, so most lives are small and a few are very large.
-    # Rounded to the nearest 50,000. A small share has nil cover to exercise that case.
     sum_assured = np.round(rng.lognormal(mean=14.2, sigma=1.0, size=lives) / 50_000) * 50_000
     sum_assured = np.clip(sum_assured, 50_000, 100_000_000)
     sum_assured[rng.random(lives) < 0.01] = 0
 
-    return pd.DataFrame({"PolicyID": [f"SYN{i:07d}" for i in range(1, lives + 1)],
-                         "Age": ages,
-                         "SumAssured": sum_assured.astype(np.int64)})
+    return pd.DataFrame({
+        "PolicyID": [f"SYN{i:07d}" for i in range(1, lives + 1)],
+        "Age": ages,
+        "SumAssured": sum_assured.astype(np.int64),
+    })
 
 
 def main():
