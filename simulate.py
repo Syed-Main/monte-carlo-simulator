@@ -36,6 +36,10 @@ TAIL_LEVEL = 99            # VaR and CTE are measured at this percentile
 TAIL_RANK_BY = "Retained"  # column used to pick the VaR / CTE years ("Gross" or "Retained")
 FREQUENCY_RANK_BY = "Claims"   # column used to pick the frequency VaR / CTE years
 OUTPUT_FOLDER = Path("output")
+# Mortality adjustment for large sums assured: qx is divided by MORTALITY_DIVISOR for every life
+# with sum assured strictly greater than ADJUST_ABOVE_SUM_ASSURED. Set the divisor to 1 to switch off.
+ADJUST_ABOVE_SUM_ASSURED = 10_000_000
+MORTALITY_DIVISOR = 3
 CELLS_PER_BATCH = 10_000_000   # memory control only; does not change results
 EXCEL_MAX_DATA_ROWS = 1_048_575   # Excel allows 1,048,576 rows including the header
 
@@ -158,7 +162,9 @@ def check_inputs(policies, mortality):
     checked = policies.copy()
     checked["Age"] = checked["Age"].astype(int)
     checked["SumAssured"] = sa
-    checked["qx"] = checked["Age"].map(rates)
+    checked["qx_table"] = checked["Age"].map(rates)
+    large = checked["SumAssured"] > ADJUST_ABOVE_SUM_ASSURED
+    checked["qx"] = np.where(large, checked["qx_table"] / MORTALITY_DIVISOR, checked["qx_table"])
     return checked
 
 
@@ -464,6 +470,9 @@ def main():
     policies, mortality = read_inputs(settings["input_file"])
     policies = check_inputs(policies, mortality)
     print(f"  {len(policies):,} lives, total sum assured {policies['SumAssured'].sum():,.0f}")
+    if MORTALITY_DIVISOR != 1:
+        n_adj = int((policies["SumAssured"] > ADJUST_ABOVE_SUM_ASSURED).sum())
+        print(f"  qx divided by {MORTALITY_DIVISOR:g} for {n_adj:,} lives with sum assured above {ADJUST_ABOVE_SUM_ASSURED:,}")
 
     print("Simulating...")
     sims = simulate(policies["qx"].to_numpy(), policies["SumAssured"].to_numpy(dtype=float),
@@ -481,7 +490,11 @@ def main():
         ("Portfolio fingerprint", portfolio_fingerprint(policies)),
         ("Number of lives", len(policies)),
         ("Total sum assured", policies["SumAssured"].sum()),
-        ("Expected deaths (sum of qx)", policies["qx"].sum()),
+        ("Mortality adjustment: sum assured above", ADJUST_ABOVE_SUM_ASSURED),
+        ("Mortality adjustment: qx divided by", MORTALITY_DIVISOR),
+        ("Lives with adjusted qx", int((policies["SumAssured"] > ADJUST_ABOVE_SUM_ASSURED).sum())),
+        ("Expected deaths before adjustment (table qx)", policies["qx_table"].sum()),
+        ("Expected deaths (sum of adjusted qx)", policies["qx"].sum()),
         ("Expected claims (sum of qx, sum assured > 0)", exact["Claims"]),
         ("Retention limit", retention),
         ("Lives above retention", int((policies["SumAssured"] > retention).sum())),
