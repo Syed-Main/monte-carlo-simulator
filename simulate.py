@@ -329,16 +329,25 @@ def calculate_metrics(sims, exact, percentiles):
     # Amounts (severity)
     amount_cols = ["Gross", "Retained", "Ceded"]
     summary, var_rows = metrics_table(sims, amount_cols, exact, TAIL_RANK_BY)
+    # Same basis as VaR in the Summary sheet: for each percentile, find the simulated year(s) whose
+    # TAIL_RANK_BY total is closest to that percentile, then report every column for those same years.
+    pct_rows = [var_scenarios(sims, TAIL_RANK_BY, level=p) for p in percentiles]
     pct = pd.DataFrame({"Percentile": [f"{p:g}%" for p in percentiles]})
     for col in amount_cols:
-        pct[col] = np.percentile(sims[col], percentiles)
+        values = sims[col].to_numpy()
+        pct[col] = [values[rows].mean() for rows in pct_rows]
+    pct["Scenario (simulation numbers)"] = [list_simulations(sims, rows) for rows in pct_rows]
 
     # Frequency (number of claims)
     count_cols = ["Claims", "Ceded claims"] + claim_band_labels()
     frequency, freq_var_rows = metrics_table(sims, count_cols, exact, FREQUENCY_RANK_BY)
+    # Same basis as the frequency VaR: years ranked by FREQUENCY_RANK_BY, every column read from those years.
+    freq_pct_rows = [var_scenarios(sims, FREQUENCY_RANK_BY, level=p) for p in percentiles]
     freq_pct = pd.DataFrame({"Metric": [f"Percentile {p:g}%" for p in percentiles]})
     for col in count_cols:
-        freq_pct[col] = np.percentile(sims[col], percentiles)
+        values = sims[col].to_numpy()
+        freq_pct[col] = [values[rows].mean() for rows in freq_pct_rows]
+    freq_pct["Scenario (simulation numbers)"] = [list_simulations(sims, rows) for rows in freq_pct_rows]
     frequency = pd.concat([frequency, freq_pct], ignore_index=True)
 
     var_sims = {"amounts": list_simulations(sims, var_rows),
@@ -574,7 +583,7 @@ def main():
     save_results(path, run_info, summary, pct, frequency, sims)
 
     print("\n" + summary.to_string(index=False, float_format=lambda v: f"{v:,.0f}"))
-    print("\n" + frequency.head(len(summary)).to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
+    print("\n" + frequency.head(len(summary)).drop(columns="Scenario (simulation numbers)").to_string(index=False, float_format=lambda v: f"{v:,.2f}"))
     print(f"\nSaved: {path}")
 
     if not settings["granularity"]:
